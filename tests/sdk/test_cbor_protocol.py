@@ -545,6 +545,7 @@ class TestCBORNamedTuple:
 
     def test_encode_namedtuple_record_id(self) -> None:
         """NamedTuple values inside RecordId are encoded as CBOR arrays."""
+
         class Key(NamedTuple):
             day: date
             n: int = 0
