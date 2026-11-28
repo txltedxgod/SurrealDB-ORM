@@ -1,4 +1,4 @@
-"""Tests for the automerge workflow's "Sync to v2 / v3" job.
+"""Tests for the automerge workflow's "Sync to v3" job (once also v2).
 
 Regression: a *grouped* Dependabot PR (#217 bumped ``tornado`` and ``urllib3``
 together) reports its dependency names as one comma-separated string,
@@ -7,13 +7,13 @@ name in v2's ``uv.lock``, found nothing, logged "not found in v2 — skipping
 sync" and finished green. Every grouped update was silently dropped for the LTS
 line, which stayed on six known advisories until a manual audit.
 
-The theme of the fixes, and of these tests: a run that leaves v2 unsynced must
+The theme of the fixes, and of these tests: a run that leaves the target unsynced must
 never look like a run that synced it. Each path either does the work, skips for
 a stated reason, warns, or fails.
 
 The real shell blocks are extracted from the workflow and executed: the gate
 and the presence check directly, the update step against a temporary git
-repository (with a bare ``origin`` carrying ``main`` and ``v2``) and fake
+repository (with a bare ``origin`` carrying ``main`` and the target branch) and fake
 ``uv`` / ``gh`` binaries on ``PATH``, and the automerge job's metadata step on
 the PR body the update step produces.
 
@@ -21,6 +21,14 @@ the PR body the update step produces.
 ``sync-lts``, runs the same steps once per target branch (``TARGET``), so a
 Dependabot ``uv`` security update merged on ``main`` reaches ``v3`` exactly as
 it reaches ``v2``.
+
+#698 gives ``v3`` the 0.39.x patch series, so the ``v3`` sync no longer waits
+for ``main`` to leave 0.39.x: the whole job runs here step by step with
+``main`` on 0.39.x and opens the ``v3`` sync PR.
+
+#703 ends the ``v2`` half: the ``v2`` line stopped at 0.21.62, so its
+Dependabot entry is gone and ``sync-lts`` runs for ``v3`` only. The tests
+that used a ``v2`` checkout now run the same checks on ``v3``.
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ from typing import Any
 
 import pytest
 
-from tests._release_series import owner_repo, pyproject
+from tests._release_series import JobRun, pyproject, run_job
 
 yaml = pytest.importorskip("yaml", reason="pyyaml required for workflow lint tests")
 
@@ -46,7 +54,7 @@ DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 GITHUB_TITLE_LIMIT = 256
 
 JOB = "sync-lts"
-TARGETS = ["v2", "v3"]
+TARGETS = ["v3"]
 
 
 def _lock(*packages: tuple[str, str]) -> str:
@@ -54,7 +62,7 @@ def _lock(*packages: tuple[str, str]) -> str:
     return "version = 1\n" + entries
 
 
-V2_LOCK = _lock(("tornado", "6.5.8"), ("urllib3", "2.7.0"), ("typing-extensions", "4.12.0"), ("cbor2", "5.9.0"))
+TARGET_LOCK = _lock(("tornado", "6.5.8"), ("urllib3", "2.7.0"), ("typing-extensions", "4.12.0"), ("cbor2", "5.9.0"))
 
 
 def _workflow() -> dict[str, Any]:
@@ -83,7 +91,7 @@ def _bash(script: str, cwd: Path, env: dict[str, str]) -> subprocess.CompletedPr
 # ---------------------------------------------------------------------------
 
 
-def _run_gate(tmp_path: Path, ecosystem: str, target: str = "v2") -> subprocess.CompletedProcess[str]:
+def _run_gate(tmp_path: Path, ecosystem: str, target: str = "v3") -> subprocess.CompletedProcess[str]:
     out = tmp_path / "gate"
     out.write_text("")
     env = {**os.environ, "ECOSYSTEM": ecosystem, "TARGET": target, "GITHUB_OUTPUT": str(out)}
@@ -120,16 +128,17 @@ class TestGate:
         for step in steps[gate + 1 :]:
             assert "steps.gate.outputs.sync == 'true'" in step.get("if", ""), step.get("name")
 
-    def test_every_step_after_the_owner_check_is_behind_it(self) -> None:
-        # #579: nothing is installed, resolved, pushed or opened for a target
-        # whose patch series main owns.
+    def test_no_step_waits_on_main_version(self) -> None:
+        # #698: v3 owns the 0.39.x patch series, so the sync to v3 no longer
+        # defers to main while both share X.Y. Only the gate and the package
+        # check decide; nothing reads main's pyproject.toml.
         steps = _workflow()["jobs"][JOB]["steps"]
         names = [s.get("name", "") for s in steps]
-        owner = names.index("Defer to main while it owns the patch series")
-        assert names.index("Checkout target branch") < owner < names.index("Update dependencies and create PR")
-        assert steps[owner]["id"] == "owner"
-        for step in steps[owner + 1 :]:
-            assert "steps.owner.outputs.sync == 'true'" in step.get("if", ""), step.get("name")
+        assert not any(n.startswith("Defer to main") for n in names), names
+        assert all(s.get("id") != "owner" for s in steps)
+        for step in steps:
+            assert "steps.owner." not in str(step.get("if", "")), step.get("name")
+            assert "pyproject.toml" not in str(step.get("run", "")), step.get("name")
 
 
 class TestUvMeansSecurity:
@@ -138,28 +147,30 @@ class TestUvMeansSecurity:
     def test_no_uv_version_update_config_on_main(self) -> None:
         # Dependabot opens *security* updates on the default branch for every
         # ecosystem it detects, but *version* updates only for configured ones.
-        # With no `uv` entry, a `uv` PR on main is a security update. Routine
-        # version updates reach v2 through its own `target-branch: v2` entry,
-        # so syncing them too would race it on the same uv.lock lines and ship
-        # a v2 release for a ruff bump. Adding a `uv` entry breaks the gate.
+        # With no `uv` entry, a `uv` PR on main is a security update, and only
+        # those are synced to v3: a routine ruff bump must not ship a v3
+        # release. Adding a `uv` entry breaks the gate.
         config: dict[str, Any] = yaml.safe_load(DEPENDABOT.read_text(encoding="utf-8"))
         ecosystems = {u["package-ecosystem"] for u in config["updates"] if u.get("target-branch", "main") == "main"}
         assert "uv" not in ecosystems
 
-    def test_v2_has_its_own_version_updates(self) -> None:
+    def test_no_dependabot_entry_targets_v2(self) -> None:
+        # #703: the v2 line ended at 0.21.62. An entry with `target-branch: v2`
+        # kept opening routine PRs there, each one an automatic 0.21.x release.
         config: dict[str, Any] = yaml.safe_load(DEPENDABOT.read_text(encoding="utf-8"))
-        assert any(u.get("target-branch") == "v2" for u in config["updates"])
+        targets = [u.get("target-branch") for u in config["updates"]]
+        assert "v2" not in targets, targets
 
     def test_no_uv_version_update_config_on_any_branch(self) -> None:
         # #579: the same reading holds for v3. A `uv` version-update entry with
-        # `target-branch: v3` (or v2) would open routine `uv` PRs on that branch
+        # `target-branch: v3` would open routine `uv` PRs on that branch
         # and race the security sync on the same uv.lock lines.
         config: dict[str, Any] = yaml.safe_load(DEPENDABOT.read_text(encoding="utf-8"))
         assert all(u["package-ecosystem"] != "uv" for u in config["updates"])
 
     def test_only_prs_merged_on_main_are_synced(self) -> None:
-        # The sync source is always main: a security-sync PR merged on v2 or v3
-        # must not fan out again to the other branch.
+        # The sync source is always main: a security-sync PR merged on v3 is
+        # not synced again.
         cond = " ".join(str(_workflow()["jobs"][JOB]["if"]).split())
         assert "github.event.pull_request.base.ref == 'main'" in cond
         assert "needs.automerge.outputs.merged == 'true'" in cond
@@ -171,7 +182,7 @@ class TestMatrix:
     def test_the_job_runs_once_per_target(self) -> None:
         job = _workflow()["jobs"][JOB]
         assert job["strategy"]["matrix"]["target"] == TARGETS
-        # A failed sync to one branch must not cancel the other.
+        # Kept with one target: a target added later must not cancel the others.
         assert job["strategy"]["fail-fast"] is False
 
     def test_the_old_v2_only_job_is_gone(self) -> None:
@@ -198,108 +209,96 @@ class TestMatrix:
 
 
 # ---------------------------------------------------------------------------
-# #579: one patch series has one owner
+# #698: v3 owns the 0.39.x patch series
 # ---------------------------------------------------------------------------
 #
-# While main's pyproject.toml has the same X.Y as v3's, main owns that series
-# (it releases 0.39.10, 0.39.11, ... until the 4.x pin). A sync PR on v3 would
-# end in a v3 bump computing one of main's numbers, so v3 takes none until
-# main leaves the series. v2 (0.21.x) is not concerned.
+# v3 was cut from v0.39.9 and releases every later 0.39.x; main releases
+# 0.40.0 next. A uv security update merged on main is therefore synced to v3
+# whatever main's version is, and v3's own bump releases it. The whole job runs
+# here, step by step, in a clone of the target whose origin also has main.
+
+_SYNC_CONTEXT = {
+    "needs.automerge.outputs.package-ecosystem": "uv",
+    "needs.automerge.outputs.dependency-names": "tornado, urllib3",
+    "needs.automerge.outputs.update-type": "version-update:semver-patch",
+    "github.event.pull_request.number": "217",
+    "secrets.PAT_TOKEN": "x",
+}
 
 
-def _run_owner(
-    tmp_path: Path, *, main: str | None, target_version: str, target: str = "v3"
-) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
-    repo = owner_repo(tmp_path, main=main, target_version=target_version, target=target)
-    out = tmp_path / "owner"
-    out.write_text("")
-    env = {**os.environ, "TARGET": target, "GITHUB_OUTPUT": str(out)}
-    result = _bash(_step(JOB, "Defer to main")["run"], repo, env)
-    return result, _outputs(out)
+def _run_sync_job(box: Sandbox, upgrades: dict[str, Any]) -> JobRun:
+    env = {
+        **os.environ,
+        "PATH": f"{box.bin}:{os.environ['PATH']}",
+        "GITHUB_REPOSITORY": "owner/repo",
+        "FAKE_UV_UPGRADES": json.dumps(upgrades),
+        "FAKE_GH_OPEN_PRS": "0",
+        "FAKE_GH_LOG": str(box.gh_log),
+        "GITHUB_STEP_SUMMARY": str(box.tmp / "summary.md"),
+    }
+    context = {**_SYNC_CONTEXT, "matrix.target": box.target}
+    return run_job(_workflow()["jobs"][JOB]["steps"], cwd=box.repo, scratch=box.tmp / "steps", env=env, context=context)
 
 
-class TestPatchSeriesOwner:
-    @pytest.mark.parametrize(("on_main", "on_v3"), [("0.39.9", "0.39.9"), ("0.39.12", "0.39.9"), ("0.39.0", "0.39.9")])
-    def test_v3_is_not_synced_while_main_shares_its_series(self, tmp_path: Path, on_main: str, on_v3: str) -> None:
-        result, outputs = _run_owner(tmp_path, main=pyproject(on_main), target_version=pyproject(on_v3))
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert outputs == {"sync": "false"}
-        assert "::notice::v3 follows main until main leaves 0.39.x; no sync" in result.stdout
+class TestV3OwnsItsSeries:
+    @pytest.mark.parametrize("on_main", ["0.39.9", "0.39.12", "0.39.0", "0.40.0"])
+    def test_v3_is_synced_whatever_main_is_on(self, tmp_path: Path, on_main: str) -> None:
+        """Before #698 no v3 sync PR was opened while main was on 0.39.x."""
+        box = Sandbox(tmp_path, target="v3", main_version=on_main, target_version="0.39.9")
+        run = _run_sync_job(box, GROUP)
+        assert run.returncode == 0, run.log
+        assert run.ran[-1] == "Update dependencies and create PR", run.ran
+        assert box.arg("--base") == "v3"
+        assert "<!-- security-sync-packages: tornado urllib3 -->" in box.arg("--body")
+        lock = box.remote_lock(box.sync_branch())
+        assert 'version = "6.5.9"' in lock and 'version = "2.8.0"' in lock
 
-    @pytest.mark.parametrize("on_main", ["0.40.0", "0.40.3", "0.41.0"])
-    def test_v3_is_synced_once_main_leaves_the_series(self, tmp_path: Path, on_main: str) -> None:
-        result, outputs = _run_owner(tmp_path, main=pyproject(on_main), target_version=pyproject("0.39.9"))
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert outputs == {"sync": "true"}
-        assert "::notice::" not in result.stdout
+    def test_v3_is_synced_without_a_readable_main_version(self, tmp_path: Path) -> None:
+        """Nothing in the job reads main's version, so a main without one does not stop the sync."""
+        box = Sandbox(tmp_path, target="v3", main_version=None, target_version="0.39.9")
+        run = _run_sync_job(box, GROUP)
+        assert run.returncode == 0, run.log
+        assert box.arg("--base") == "v3"
 
-    @pytest.mark.parametrize(
-        "main",
-        [
-            pyproject("0.39.9"),
-            pyproject("0.21.62"),
-            None,  # no main branch at all
-            "",  # no pyproject.toml on main
-            "[project]\nname = 'x'\n",  # no readable version
-        ],
-    )
-    def test_v2_is_never_affected(self, tmp_path: Path, main: str | None) -> None:
-        result, outputs = _run_owner(tmp_path, main=main, target_version=pyproject("0.21.62"), target="v2")
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert outputs == {"sync": "true"}
+    def test_v2_is_not_a_sync_target(self) -> None:
+        """#703: the v2 line ended at 0.21.62, so no update is synced to it any more."""
+        targets = _workflow()["jobs"][JOB]["strategy"]["matrix"]["target"]
+        assert "v2" not in targets, targets
 
-    @pytest.mark.parametrize(
-        "main",
-        [
-            None,  # main cannot be fetched
-            "[project]\nname = 'x'\n",  # no version line
-            pyproject("0.40.0rc1"),
-            pyproject("v0.40.0"),
-            pyproject("0.40"),
-            pyproject("0.40.0\nversion = 0.39.9"),
-            # An X bump is the user's decision: the rule is re-read then.
-            pyproject("1.0.0"),
-        ],
-        ids=["no-main", "no-version", "pre-release", "prefixed", "two-parts", "two-lines", "main-1.x"],
-    )
-    def test_an_unreadable_main_version_fails_closed(self, tmp_path: Path, main: str | None) -> None:
-        result, outputs = _run_owner(tmp_path, main=main, target_version=pyproject("0.39.9"))
-        assert result.returncode != 0, result.stdout + result.stderr
-        assert "::error::" in result.stdout
-        assert "sync" not in outputs
+    def test_the_gate_still_stops_a_non_uv_update(self, tmp_path: Path) -> None:
+        box = Sandbox(tmp_path, target="v3", main_version="0.39.9", target_version="0.39.9")
+        context = {**_SYNC_CONTEXT, "matrix.target": "v3", "needs.automerge.outputs.package-ecosystem": "pip"}
+        run = run_job(
+            _workflow()["jobs"][JOB]["steps"],
+            cwd=box.repo,
+            scratch=box.tmp / "steps",
+            env={**os.environ, "PATH": f"{box.bin}:{os.environ['PATH']}", "FAKE_GH_LOG": str(box.gh_log)},
+            context=context,
+        )
+        assert run.returncode == 0, run.log
+        assert run.ran == ["Decide whether this update is synced"], run.ran
+        assert box.gh_calls() == []
 
-    def test_a_missing_main_pyproject_fails_closed(self, tmp_path: Path) -> None:
-        result, outputs = _run_owner(tmp_path, main="", target_version=pyproject("0.39.9"))
-        assert result.returncode != 0, result.stdout + result.stderr
-        assert "::error::" in result.stdout
-        assert "sync" not in outputs
-
-    @pytest.mark.parametrize("target_version", ["", "[project]\nname = 'x'\n", pyproject("0.39")])
-    def test_an_unreadable_v3_version_fails_closed(self, tmp_path: Path, target_version: str) -> None:
-        result, outputs = _run_owner(tmp_path, main=pyproject("0.40.0"), target_version=target_version)
-        assert result.returncode != 0, result.stdout + result.stderr
-        assert "::error::" in result.stdout
-        assert "sync" not in outputs
-
-    def test_main_and_v3_never_compute_the_same_number(self, tmp_path: Path) -> None:
-        # A v3 sync PR is what leads to a v3 bump (x.y.z -> x.y.z+1). Whenever
-        # the sync is open, main's next bump and v3's are in different series.
-        for index, on_main in enumerate(["0.39.9", "0.39.10", "0.39.11", "0.40.0", "0.40.1"]):
-            run_dir = tmp_path / str(index)
-            run_dir.mkdir()
-            result, outputs = _run_owner(run_dir, main=pyproject(on_main), target_version=pyproject("0.39.9"))
-            assert result.returncode == 0, result.stdout + result.stderr
-            if outputs["sync"] == "true":
-                assert on_main.rsplit(".", 1)[0] != "0.39", on_main
+    def test_a_held_back_package_is_still_reported_on_v3(self, tmp_path: Path) -> None:
+        box = Sandbox(
+            tmp_path,
+            target="v3",
+            main_lock=_lock(("tornado", "6.5.9"), ("urllib3", "2.8.0")),
+            main_version="0.39.9",
+            target_version="0.39.9",
+        )
+        run = _run_sync_job(box, {"tornado": "6.5.9"})
+        assert run.returncode == 0, run.log
+        assert "::warning::urllib3 stays at 2.7.0 on v3 while main has 2.8.0" in run.log
 
 
 # ---------------------------------------------------------------------------
-# Which packages exist on v2
+# Which packages exist on the target
 # ---------------------------------------------------------------------------
 
 
-def _run_check(tmp_path: Path, dep_names: str, target: str = "v2") -> subprocess.CompletedProcess[str]:
-    (tmp_path / "uv.lock").write_text(V2_LOCK)
+def _run_check(tmp_path: Path, dep_names: str, target: str = "v3") -> subprocess.CompletedProcess[str]:
+    (tmp_path / "uv.lock").write_text(TARGET_LOCK)
     out = tmp_path / "out"
     out.write_text("")
     env = {**os.environ, "DEP_NAME": dep_names, "TARGET": target, "GITHUB_OUTPUT": str(out)}
@@ -328,7 +327,7 @@ class TestCheckStep:
         assert "some-main-only-pkg" in result.stdout
         assert f"not in {target}'s uv.lock" in result.stdout
 
-    def test_no_name_in_v2_is_a_quiet_skip(self, tmp_path: Path) -> None:
+    def test_no_name_in_the_target_is_a_quiet_skip(self, tmp_path: Path) -> None:
         result = _run_check(tmp_path, "some-main-only-pkg")
         assert result.returncode == 0, result.stderr
         assert _outputs(tmp_path / "out")["exists"] == "false"
@@ -357,7 +356,7 @@ FAKE_UV = """\
 # Fake `uv lock --upgrade-package A --upgrade-package B ...`.
 # FAKE_UV_UPGRADES = {"pkg": "new"} bumps every entry of pkg;
 #                    {"pkg": ["old", "new"]} bumps only the entry at `old`.
-# Packages it is not told about stay put, like a v2 constraint holding them.
+# Packages it is not told about stay put, like a target constraint holding them.
 import json, os, re, sys
 args = sys.argv[1:]
 assert args[0] == "lock", args
@@ -393,7 +392,16 @@ def _write_exe(path: Path, body: str) -> None:
 class Sandbox:
     """A checkout of the target branch whose `origin` also has `main`, plus fake uv/gh."""
 
-    def __init__(self, tmp_path: Path, v2_lock: str = V2_LOCK, main_lock: str | None = None, target: str = "v2") -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        target_lock: str = TARGET_LOCK,
+        main_lock: str | None = None,
+        target: str = "v3",
+        *,
+        main_version: str | None = None,
+        target_version: str | None = None,
+    ) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)
         self.tmp = tmp_path
         self.target = target
@@ -405,10 +413,12 @@ class Sandbox:
 
         seed = tmp_path / "seed"
         subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True)
-        self._commit(seed, main_lock if main_lock is not None else v2_lock, "main")
+        self._commit(seed, main_lock if main_lock is not None else target_lock, "main", main_version)
         subprocess.run(["git", "-C", str(seed), "push", "-q", str(self.origin), "main"], check=True)
         subprocess.run(["git", "-C", str(seed), "checkout", "-q", "--orphan", target], check=True)
-        self._commit(seed, v2_lock, target)
+        subprocess.run(["git", "-C", str(seed), "rm", "-q", "--cached", "--ignore-unmatch", "pyproject.toml"], check=True)
+        (seed / "pyproject.toml").unlink(missing_ok=True)
+        self._commit(seed, target_lock, target, target_version)
         subprocess.run(["git", "-C", str(seed), "push", "-q", str(self.origin), target], check=True)
         subprocess.run(["git", "clone", "-q", "-b", target, str(self.origin), str(self.repo)], check=True)
 
@@ -418,10 +428,13 @@ class Sandbox:
         _write_exe(self.bin / "gh", FAKE_GH)
 
     @staticmethod
-    def _commit(repo: Path, lock: str, msg: str) -> None:
+    def _commit(repo: Path, lock: str, msg: str, version: str | None = None) -> None:
         (repo / "uv.lock").write_text(lock)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
         subprocess.run([*git, "add", "uv.lock"], check=True)
+        if version is not None:
+            (repo / "pyproject.toml").write_text(pyproject(version))
+            subprocess.run([*git, "add", "pyproject.toml"], check=True)
         subprocess.run([*git, "commit", "-q", "-m", msg], check=True)
 
     def run(self, packages: str, upgrades: dict[str, Any], open_prs: int = 0) -> subprocess.CompletedProcess[str]:
@@ -502,11 +515,12 @@ class TestUpdateStep:
         assert "&base=v3&" in query and ":chore/sync-v3-" in query, query
 
     def test_the_same_update_gets_one_branch_per_target(self, tmp_path: Path) -> None:
-        on_v2 = Sandbox(tmp_path / "a", target="v2")
-        on_v3 = Sandbox(tmp_path / "b", target="v3")
-        assert on_v2.run("tornado urllib3", GROUP).returncode == 0
+        # One real target today (#703); "next-lts" stands for one added later.
+        on_v3 = Sandbox(tmp_path / "a", target="v3")
+        on_next = Sandbox(tmp_path / "b", target="next-lts")
         assert on_v3.run("tornado urllib3", GROUP).returncode == 0
-        assert on_v2.sync_branch().removeprefix("chore/sync-v2-") == on_v3.sync_branch().removeprefix("chore/sync-v3-")
+        assert on_next.run("tornado urllib3", GROUP).returncode == 0
+        assert on_v3.sync_branch().removeprefix("chore/sync-v3-") == on_next.sync_branch().removeprefix("chore/sync-next-lts-")
 
     def test_body_carries_the_versions_and_a_machine_readable_package_list(self, tmp_path: Path) -> None:
         box = Sandbox(tmp_path)
@@ -521,7 +535,7 @@ class TestUpdateStep:
         # Review of #220: `python-patch` matches `*`, so a group has no size bound;
         # an unbounded title is rejected by GitHub *after* the push.
         names = [f"some-rather-long-package-name-number-{i:02d}" for i in range(12)]
-        box = Sandbox(tmp_path, v2_lock=_lock(*[(n, "1.0.0") for n in names]))
+        box = Sandbox(tmp_path, target_lock=_lock(*[(n, "1.0.0") for n in names]))
         result = box.run(" ".join(names), {n: "1.0.1" for n in names})
         assert result.returncode == 0, result.stdout + result.stderr
         title = box.arg("--title")
@@ -548,7 +562,7 @@ class TestUpdateStep:
     def test_a_leftover_branch_without_an_open_pr_is_recreated(self, tmp_path: Path) -> None:
         # Review of #220: the old guard skipped on "branch exists". A push that
         # succeeded before `gh pr create` failed, or a closed PR, then made every
-        # re-run exit green with v2 still unsynced.
+        # re-run exit green with the target still unsynced.
         box = Sandbox(tmp_path)
         assert box.run("tornado urllib3", GROUP).returncode == 0
         box.gh_log.write_text("")
@@ -558,10 +572,10 @@ class TestUpdateStep:
         assert result.returncode == 0, result.stdout + result.stderr
         assert box.pr_create() is not None
 
-    def test_a_package_v2_cannot_upgrade_is_a_warning_not_a_quiet_success(self, tmp_path: Path) -> None:
-        # Review of #220: `cbor2 <6` on v2 makes `uv lock --upgrade-package cbor2`
-        # a no-op, which read as "v2 already up to date". A fix that cannot reach
-        # v2 must be visible.
+    def test_a_package_the_target_cannot_upgrade_is_a_warning_not_a_quiet_success(self, tmp_path: Path) -> None:
+        # Review of #220: `cbor2 <6` on v2 made `uv lock --upgrade-package cbor2`
+        # a no-op, which read as "v2 already up to date". A fix that a target's
+        # constraints keep out must be visible.
         box = Sandbox(tmp_path, main_lock=_lock(("cbor2", "6.1.2")))
         result = box.run("cbor2", {})
         assert result.returncode == 0, result.stdout + result.stderr
@@ -578,7 +592,7 @@ class TestUpdateStep:
         assert "cbor2" in box.arg("--body")
 
     def test_already_up_to_date_is_a_plain_skip(self, tmp_path: Path) -> None:
-        box = Sandbox(tmp_path, v2_lock=_lock(("tornado", "6.5.9")), main_lock=_lock(("tornado", "6.5.9")))
+        box = Sandbox(tmp_path, target_lock=_lock(("tornado", "6.5.9")), main_lock=_lock(("tornado", "6.5.9")))
         result = box.run("tornado", {})
         assert result.returncode == 0, result.stdout + result.stderr
         assert "::warning::" not in result.stdout
@@ -587,9 +601,9 @@ class TestUpdateStep:
     def test_a_package_with_several_lock_entries_is_seen_moving(self, tmp_path: Path) -> None:
         # Review of #220: forked resolutions give one name several [[package]]
         # entries; reading only the first missed an upgrade of the second.
-        v2_lock = _lock(("anyio", "3.7.1"), ("anyio", "4.13.0"))
+        target_lock = _lock(("anyio", "3.7.1"), ("anyio", "4.13.0"))
         main_lock = _lock(("anyio", "3.7.1"), ("anyio", "4.14.2"))
-        box = Sandbox(tmp_path, v2_lock=v2_lock, main_lock=main_lock)
+        box = Sandbox(tmp_path, target_lock=target_lock, main_lock=main_lock)
         result = box.run("anyio", {"anyio": ["4.13.0", "4.14.2"]})
         assert result.returncode == 0, result.stdout + result.stderr
         assert box.pr_create() is not None
@@ -597,7 +611,7 @@ class TestUpdateStep:
 
 
 # ---------------------------------------------------------------------------
-# The sync PR, once it lands on v2
+# The sync PR, once it lands on the target
 # ---------------------------------------------------------------------------
 
 
